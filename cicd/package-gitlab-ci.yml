@@ -1,0 +1,30 @@
+stages:
+  - test
+  - publish
+
+test:
+  stage: test
+  image: node:20
+  before_script:
+    - node -v
+    - npm -v
+    - npm config set registry ${NPM_REGISTRY}
+  script:
+    - npm ci
+    - npm test
+
+publish:
+  stage: publish
+  image: node:20
+  before_script:
+    - node -v
+    - npm -v
+    - npm config set registry ${NPM_REGISTRY}
+  script:
+    - echo "@cluster:registry=https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/packages/npm/" > .npmrc
+    - echo "//${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/packages/npm/:_authToken=${CI_JOB_TOKEN}" >> .npmrc
+    - npm ci
+    - npm version patch --no-git-tag-version
+    - npm publish
+  only:
+    - main

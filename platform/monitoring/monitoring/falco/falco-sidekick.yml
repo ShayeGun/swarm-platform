@@ -1,0 +1,4 @@
+listenport: 2801
+
+webui:
+  url: "http://falcosidekick-ui:2802"

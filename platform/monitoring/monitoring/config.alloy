@@ -1,0 +1,206 @@
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ======================
+// ======== Logs ========
+// ======================
+
+discovery.docker "local_docker" {
+  host = "unix:///var/run/docker.sock"
+
+  // Only discover active/running containers.
+  filter {
+    name   = "status"
+    values = ["running"]
+  }
+}
+
+// Relabel Docker / Swarm containers for Loki
+discovery.relabel "logs_integrations_docker" {
+  targets = discovery.docker.local_docker.targets
+
+// Prefer Docker Swarm service name when available.
+rule {
+  source_labels = ["__meta_docker_container_label_com_docker_swarm_service_name"]
+  regex         = "(.+)"
+  target_label  = "service_name"
+  replacement   = "$1"
+}
+
+// Fallback only for non-Swarm containers.
+// "/mongo" or "mongo" -> "mongo"
+rule {
+  source_labels = ["__meta_docker_container_label_com_docker_swarm_service_name", "__meta_docker_container_name"]
+  separator     = ";"
+  regex         = ";/?(.+)"
+  target_label  = "service_name"
+  replacement   = "$1"
+}
+
+  // Stack name: "monitoring", "app", etc.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_stack_namespace"]
+    regex         = "(.+)"
+    target_label  = "stack"
+    replacement   = "$1"
+  }
+
+ // Normalize Swarm task/container suffix.
+// "monitoring_grafana.1.xxxxx" -> "monitoring_grafana"
+// "app_mongo.1.xxxxx" -> "app_mongo"
+// "mongo" -> "mongo"
+rule {
+  source_labels = ["service_name"]
+  regex         = "(.+?)\\.[0-9]+\\..+"
+  target_label  = "logical_service"
+  replacement   = "$1"
+}
+
+// If there was no Swarm task suffix, keep service_name as logical_service.
+rule {
+  source_labels = ["logical_service", "service_name"]
+  separator     = ";"
+  regex         = ";(.+)"
+  target_label  = "logical_service"
+  replacement   = "$1"
+}
+
+// Default group.
+rule {
+  target_label = "service_group"
+  replacement  = "services"
+}
+
+// Monitoring stack.
+rule {
+  source_labels = ["logical_service"]
+  regex         = "(.+_)?(grafana|mimir|loki|prometheus|alloy|tempo|alertmanager|node-exporter|cadvisor)"
+  target_label  = "service_group"
+  replacement   = "monitoring"
+}
+
+  // Storage services.
+  rule {
+  source_labels = ["logical_service"]
+  regex         = "(.+_)?(mongodb|mongo|postgres|postgresql|redis|minio|mysql|mariadb|elasticsearch|opensearch|clickhouse)"
+  target_label  = "service_group"
+  replacement   = "database"
+}
+
+  rule {
+    target_label = "instance"
+    replacement  = constants.hostname
+  }
+
+  rule {
+    target_label = "job"
+    replacement  = "docker"
+  }
+}
+
+loki.source.docker "docker_engine" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.logs_integrations_docker.output
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+
+// ======================
+// ======= Metrics ======
+// ======================
+
+// Host metrics (node_exporter style)
+prometheus.exporter.unix "host" {
+  rootfs_path = "/rootfs"
+  procfs_path = "/rootfs/proc"
+  sysfs_path  = "/rootfs/sys"
+
+  // Optional: keep the set explicit
+  set_collectors = [
+    "cpu",
+    "diskstats",
+    "filesystem",
+    "meminfo",
+    "netdev",
+    "netstat",
+    "loadavg",
+    "stat",
+    "time",
+    "uname",
+  ]
+
+  filesystem {
+    // ignore pseudo mounts and container overlay mounts
+    mount_points_exclude = "^/(dev|proc|run|sys|var/lib/docker/.+|var/lib/containers/storage/.+|var/snap/.+)($|/)"
+  }
+
+  disk {
+    // optional: default excludes many virtual devices already
+    device_exclude = "^(ram|loop|fd|(h|s|v|xv)d[a-z]|nvme\\d+n\\d+p)\\d+$"
+  }
+}
+
+// Container metrics
+prometheus.exporter.cadvisor "docker" {
+  docker_host      = "unix:///var/run/docker.sock"
+  docker_only      = true
+  storage_duration = "5m"
+}
+
+// Give stable labels
+discovery.relabel "host_metrics" {
+  targets = prometheus.exporter.unix.host.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "node"
+  }
+
+  rule {
+    target_label = "instance"
+    replacement  = constants.hostname
+  }
+}
+
+discovery.relabel "docker_metrics" {
+  targets = prometheus.exporter.cadvisor.docker.targets
+
+  rule {
+    target_label = "job"
+    replacement  = "docker"
+  }
+
+  rule {
+    target_label = "instance"
+    replacement  = constants.hostname
+  }
+}
+
+// Scrape both exporters
+prometheus.scrape "host" {
+  targets         = discovery.relabel.host_metrics.output
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.scrape "docker" {
+  targets         = discovery.relabel.docker_metrics.output
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+// Send to Prometheus / Mimir / Grafana Cloud
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://mimir:9009/api/v1/push"
+  }
+}
+

@@ -1,0 +1,213 @@
+version: "3.8"
+
+x-common: &common
+  env_file:
+    - ../.env
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+  networks:
+    - platform
+
+x-deploy: &deploy-common
+  replicas: 1
+  restart_policy:
+    condition: any
+    delay: 5s
+
+x-secure: &secure
+  <<: *common
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  gitlab:
+    <<: *common
+    image: ${GITLAB_IMAGE:-gitlab/gitlab-ce:17.11.3-ce.0}
+    hostname: ${GITLAB_HOSTNAME:-git.platform.co}
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://${GITLAB_HOSTNAME:-git.platform.co}'
+        gitlab_rails['registry_external_url'] = 'https://registry.${DOMAIN}'
+        prometheus['enable'] = false
+        prometheus_monitoring['enable'] = false
+    ports:
+      - target: 22
+        published: 22
+        protocol: tcp
+        mode: host
+      - target: 5050
+        published: 5050
+        protocol: tcp
+        mode: host
+    volumes:
+      - ${GITLAB_DATA_PATH:-/srv/gitlab}/config:/etc/gitlab
+      - ${GITLAB_DATA_PATH:-/srv/gitlab}/logs:/var/log/gitlab
+      - ${GITLAB_DATA_PATH:-/srv/gitlab}/data:/var/opt/gitlab
+    shm_size: "256m"
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == gitlab
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.routers.gitlab.rule=Host(`git.${DOMAIN}`)"
+        - "traefik.http.routers.gitlab.entrypoints=websecure"
+        - "traefik.http.routers.gitlab.tls=true"
+        - "traefik.http.services.gitlab.loadbalancer.server.port=80"
+      restart_policy:
+        condition: any
+        delay: 10s
+      resources:
+        limits:
+          memory: 4G
+
+  jira:
+    <<: *common
+    image: ${JIRA_IMAGE:-atlassian/jira-software:9.12.0}
+    environment:
+      ATL_DB_TYPE: "postgres72"
+      ATL_JDBC_URL: "jdbc:postgresql://postgres:5432/${JIRA_DB:-jira}"
+      ATL_JDBC_USER: "${JIRA_DB_USER:-jira}"
+      ATL_JDBC_PASSWORD: "${JIRA_DB_PASSWORD:-change-me}"
+      ATL_TOMCAT_SCHEME: "https"
+      ATL_TOMCAT_SECURE: "true"
+      ATL_PROXY_PORT: "443"
+      ATL_PROXY_NAME: "jira.${DOMAIN}"
+      JAVA_OPTS: "-javaagent:/atlassian-agent.jar"
+    volumes:
+      - ${JIRA_DATA_PATH:-/data/jira}/application-data:/var/atlassian/application-data/jira
+      - ${JIRA_DATA_PATH:-/data/jira}/agent/atlassian-agent.jar:/atlassian-agent.jar:ro
+    extra_hosts:
+      - "con.platform.local:192.0.2.20"
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == jira
+      restart_policy:
+        condition: any
+        delay: 10s
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.routers.jira.rule=Host(`jira.${DOMAIN}`)"
+        - "traefik.http.routers.jira.entrypoints=websecure"
+        - "traefik.http.routers.jira.tls=true"
+        - "traefik.http.services.jira.loadbalancer.server.port=8080"
+      resources:
+        limits:
+          memory: 4G
+
+  mattermost:
+    <<: *secure
+    image: ${MATTERMOST_IMAGE:-mattermost/mattermost-enterprise-edition:10.5.2}
+    environment:
+      TZ: ${TZ:-UTC}
+      MM_SQLSETTINGS_DRIVERNAME: ${MM_SQLSETTINGS_DRIVERNAME:-postgres}
+      MM_SQLSETTINGS_DATASOURCE: ${MM_SQLSETTINGS_DATASOURCE}
+      MM_BLEVESETTINGS_INDEXDIR: ${MM_BLEVESETTINGS_INDEXDIR:-/mattermost/bleve-indexes}
+      MM_SERVICESETTINGS_SITEURL: ${MM_SERVICESETTINGS_SITEURL}
+    volumes:
+      - ${MATTERMOST_CONFIG_PATH}:/mattermost/config:rw
+      - ${MATTERMOST_DATA_PATH}:/mattermost/data:rw
+      - ${MATTERMOST_LOGS_PATH}:/mattermost/logs:rw
+      - ${MATTERMOST_PLUGINS_PATH}:/mattermost/plugins:rw
+      - ${MATTERMOST_CLIENT_PLUGINS_PATH}:/mattermost/client/plugins:rw
+      - ${MATTERMOST_BLEVE_INDEXES_PATH}:/mattermost/bleve-indexes:rw
+    read_only: ${MATTERMOST_CONTAINER_READONLY:-false}
+    tmpfs:
+      - /tmp
+    ports:
+      - target: ${CALLS_PORT:-8443}
+        published: ${CALLS_PORT:-8443}
+        protocol: udp
+        mode: host
+      - target: ${CALLS_PORT:-8443}
+        published: ${CALLS_PORT:-8443}
+        protocol: tcp
+        mode: host
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == mattermost
+      restart_policy:
+        condition: any
+        delay: 5s
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.routers.mattermost.rule=Host(`mm.${DOMAIN}`)"
+        - "traefik.http.routers.mattermost.entrypoints=websecure"
+        - "traefik.http.routers.mattermost.tls=true"
+        - "traefik.http.services.mattermost.loadbalancer.server.port=8065"
+      resources:
+        limits:
+          memory: 2G
+
+  nexus:
+    <<: *common
+    image: ${NEXUS_IMAGE:-sonatype/nexus3:3.95.3-alpine}
+    environment:
+      INSTALL4J_ADD_VM_PARAMS: "-Xms2703m -Xmx2703m -XX:MaxDirectMemorySize=2703m -Djava.util.prefs.userRoot=/nexus-data/javaprefs -Djava.net.preferIPv4Stack=true"
+    volumes:
+      - ${NEXUS_DATA_PATH:-/data/nexus}:/nexus-data
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == object-storage
+      restart_policy:
+        condition: any
+        delay: 10s
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.routers.nexus.rule=Host(`mirror.${DOMAIN}`)"
+        - "traefik.http.routers.nexus.entrypoints=websecure"
+        - "traefik.http.routers.nexus.tls=true"
+        - "traefik.http.services.nexus.loadbalancer.server.port=8081"
+        - "traefik.http.routers.docker-mirror.rule=Host(`docker-mirror.${DOMAIN}`)"
+        - "traefik.http.routers.docker-mirror.entrypoints=websecure"
+        - "traefik.http.routers.docker-mirror.tls=true"
+        - "traefik.http.services.docker-mirror.loadbalancer.server.port=7080"
+      resources:
+        limits:
+          memory: 4G
+
+  minio:
+    <<: *common
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_STS_DURATION: 168h
+    command: server /data --console-address ":9001"
+    volumes:
+      - ${MINIO_DATA_PATH:-/data/minio}:/data
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == object-storage
+      restart_policy:
+        condition: any
+        delay: 5s
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.routers.minio.rule=Host(`minio.${DOMAIN}`)"
+        - "traefik.http.routers.minio.entrypoints=websecure"
+        - "traefik.http.routers.minio.tls=true"
+        - "traefik.http.services.minio.loadbalancer.server.port=9001"
+
+networks:
+  platform:
+    external: true

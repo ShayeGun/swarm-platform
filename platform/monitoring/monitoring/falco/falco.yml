@@ -1,0 +1,38 @@
+json_output: true
+json_include_output_property: true
+
+engine:
+  kind: modern_ebpf
+
+load_plugins:
+  - container
+
+plugins:
+  - name: container
+    library_path: libcontainer.so
+    init_config:
+      engine_timeout: 10
+      engines:
+        docker:
+          enabled: true
+          sockets:
+            - /host/var/run/docker.sock
+        containerd:
+          enabled: false
+        cri:
+          enabled: false
+        podman:
+          enabled: false
+        lxc:
+          enabled: false
+        libvirt_lxc:
+          enabled: false
+        bpm:
+          enabled: false
+
+http_output:
+  enabled: true
+  url: http://falcosidekick:2801/
+
+rules_files:
+  - /etc/falco/falco_rules.yaml

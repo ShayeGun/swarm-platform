@@ -1,0 +1,198 @@
+version: "3.8"
+
+x-common: &common
+  env_file:
+    - ../.env
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+  networks:
+    - platform
+
+x-deploy: &deploy-common
+  replicas: 1
+  restart_policy:
+    condition: any
+    delay: 5s
+
+x-secure: &secure
+  <<: *common
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  falco:
+    <<: *secure
+    image: ${FALCO_IMAGE:-falcosecurity/falco:0.45.0}
+    cap_add:
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      - SYS_PTRACE
+    environment:
+      HOST_ROOT: /host
+    configs:
+      - source: falco_config
+        target: /etc/falco/falco.yaml
+    volumes:
+      - type: bind
+        source: /proc
+        target: /host/proc
+        read_only: true
+      - type: bind
+        source: /etc
+        target: /host/etc
+        read_only: true
+      - type: bind
+        source: /sys/kernel/tracing
+        target: /sys/kernel/tracing
+        read_only: true
+      - type: bind
+        source: /var/run/docker.sock
+        target: /host/var/run/docker.sock
+    deploy:
+      <<: *deploy-common
+      mode: global
+      placement:
+        constraints:
+          - node.role == worker
+
+  falcosidekick:
+    <<: *secure
+    image: ${FALCOSIDEKICK_IMAGE:-falcosecurity/falcosidekick:2.35.0}
+    command:
+      - -c
+      - /etc/falcosidekick/config.yaml
+    configs:
+      - source: falcosidekick_config
+        target: /etc/falcosidekick/config.yaml
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.role == manager
+
+  falcosidekick-ui:
+    <<: *secure
+    image: ${FALCOSIDEKICK_UI_IMAGE:-falcosecurity/falcosidekick-ui:2.3.1}
+    environment:
+      FALCOSIDEKICK_UI_REDIS_URL: "redis:6379"
+      FALCOSIDEKICK_UI_PORT: "2802"
+      FALCOSIDEKICK_UI_TTL: "24h"
+      FALCOSIDEKICK_UI_USER: "admin:admin"
+    ports:
+      - target: 2802
+        published: 2802
+        protocol: tcp
+        mode: host
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.role == manager
+
+  grafana:
+    <<: *common
+    image: ${GRAFANA_IMAGE:-grafana/grafana:12.4.0}
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-change-me}
+    volumes:
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards/:ro
+      - ./grafana/configs:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == monitoring
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.routers.grafana.rule=Host(`grafana.${DOMAIN}`)"
+        - "traefik.http.routers.grafana.entrypoints=websecure"
+        - "traefik.http.routers.grafana.tls=true"
+        - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  loki:
+    <<: *common
+    image: ${LOKI_IMAGE:-grafana/loki:3.7.1}
+    command: -config.file=/etc/loki/loki.yaml
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/tmp/loki/
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == monitoring
+
+  mimir:
+    <<: *common
+    image: ${MIMIR_IMAGE:-grafana/mimir:3.0.5}
+    command: ["-config.file=/etc/mimir/mimir.yaml"]
+    volumes:
+      - ./mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir_data:/data
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == monitoring
+
+  alloy:
+    <<: *common
+    image: ${ALLOY_IMAGE:-grafana/alloy:v1.15.0}
+    privileged: true
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /sys:/sys:ro
+      - /dev/disk/:/dev/disk:ro
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    deploy:
+      <<: *deploy-common
+      placement:
+        constraints:
+          - node.labels.server == monitoring
+
+networks:
+  platform:
+    external: true
+
+volumes:
+  loki_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/monitor/loki
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/monitor/grafana
+  mimir_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/monitor/mimir
+
+configs:
+  falco_config:
+    file: ./falco/falco.yml
+  falcosidekick_config:
+    file: ./falco/falco-sidekick.yml

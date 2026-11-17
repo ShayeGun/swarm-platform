@@ -1,0 +1,333 @@
+# x-common-deploy: &common-deploy
+#   deploy:
+#     restart_policy:
+#       condition: unless-stopped
+#     resources:
+#       limits:
+#         cpus: "0.50"
+#         memory: 1024M
+#       reservations:
+#         cpus: "0.25"
+#         memory: 256M
+
+x-common: &common
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+  networks:
+    - platform
+
+x-secure: &secure
+  <<: *common
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+
+services:
+  # Reverse proxy
+  traefik:
+    image: traefik:v3.6
+    <<: *secure
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    ports:
+      - published: 80
+        target: 80
+        protocol: tcp
+        mode: host
+      - published: 443
+        target: 443
+        protocol: tcp
+        mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik:/etc/traefik:ro
+      - traefik_certs:/letsencrypt
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  # Databases
+  postgres:
+    image: postgres:15-alpine
+    <<: *common
+    user: postgres
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.postgres.env
+    environment:
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 67108864 # 64 * 1024 * 1024
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  redis:
+    image: redis:8.0.2-alpine
+    <<: *common
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.redis.env
+    command: redis-server --maxmemory 1024mb
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  mongodb:
+    image: mongo:8.0.10
+    <<: *common
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.mongodb.env
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  # Applications
+  panel:
+    image: registry.example.com/cloud/panel/panel-${DEPLOYMENT:-production}:web-latest
+    <<: *common
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.panel.env
+    volumes:
+      - nginx_config:/opt/bitnami/nginx/conf/server_blocks
+      - nginx_js:/opt/bitnami/nginx/html/static/js
+      - nginx_glob_tmp:/tmp
+      - nginx_tmp:/opt/bitnami/nginx/tmp
+    deploy:
+      replicas: ${PANEL_REPLICAS:-1}
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.services.panel.loadbalancer.server.port=80"
+        # Service Rerfrence
+        - "traefik.http.routers.panel.service=panel"
+        # Routers TLS
+        - "traefik.http.routers.panel.tls=true"
+        # Routers Entrypoints
+        - "traefik.http.routers.panel.entrypoints=websecure"
+        # Routers Rules
+        - "traefik.http.routers.panel.rule=Host(`panel.${DOMAIN:-localhost}`)"
+
+  notify:
+    image: registry.example.com/cloud/notify-service/notify-${DEPLOYMENT:-production}:web-latest
+    <<: *secure
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.notify.env
+    deploy:
+      replicas: ${NOTIFY_REPLICAS:-1}
+      placement:
+        constraints:
+          - node.role == manager
+
+  login:
+    image: registry.example.com/cloud/authentication/login-${DEPLOYMENT:-production}:web-latest
+    <<: *secure
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.login.env
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:3000/v"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      replicas: ${LOGIN_REPLICAS:-1}
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.services.login.loadbalancer.server.port=3000"
+
+        # service reference
+        - "traefik.http.routers.login.service=login"
+
+        # router TLS
+        - "traefik.http.routers.login.tls=true"
+
+        # router entrypoint
+        - "traefik.http.routers.login.entrypoints=websecure"
+
+        # router rule
+        - "traefik.http.routers.login.rule=Host(`login.${DOMAIN:-localhost}`)"
+
+        # middleware from file provider
+        - "traefik.http.routers.login.middlewares=rate-limiter@file"
+
+  skm:
+    image: registry.example.com/cloud/server/skm-${DEPLOYMENT:-production}:web-latest
+    <<: *secure
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.skm.env
+    volumes:
+      # Overwrites "readonly" for this path
+      - skm_uploads:/usr/src/app/dist/${UPLOAD_ICON_PATH:-public/user_uploads}:rw
+    healthcheck:
+      test:
+        ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      replicas: ${SKM_REPLICAS:-1}
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=platform"
+        - "traefik.http.services.skm.loadbalancer.server.port=3000"
+
+        # Service Rerfrence
+        - "traefik.http.routers.skm-v1.service=skm"
+        - "traefik.http.routers.skm-v2.service=skm"
+
+        # Routers TLS
+        - "traefik.http.routers.skm-v1.tls=true"
+        - "traefik.http.routers.skm-v2.tls=true"
+
+        # Routers Entrypoints
+        - "traefik.http.routers.skm-v1.entrypoints=websecure"
+        - "traefik.http.routers.skm-v2.entrypoints=websecure"
+
+        # Routers Rules
+        - "traefik.http.routers.skm-v1.rule=Host(`skm.${DOMAIN:-localhost}`)"
+        - "traefik.http.routers.skm-v2.rule=Host(`${DOMAIN:-localhost}`) && PathPrefix(`/api/skm`)"
+        - "traefik.http.routers.skm-v1.middlewares=rate-limiter@file"
+        - "traefik.http.routers.skm-v2.middlewares=rate-limiter@file,skm-v2-strip"
+
+        # Middleware
+        - "traefik.http.middlewares.skm-v2-strip.stripprefix.prefixes=/api/skm"
+
+  logging:
+    image: registry.example.com/cloud/log-microservice/logging-${DEPLOYMENT:-production}:web-latest
+    <<: *secure
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.logging.env
+    command: >
+      sh -c "npx knex migrate:latest --knexfile db/knexfile.js && node main.js"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:3000"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  radius:
+    image: registry.example.com/cloud/radius/radius-${DEPLOYMENT:-production}:web-latest
+    <<: *secure
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.radius.env
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/livez"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+  task:
+    image: registry.example.com/cloud/server/skm-${DEPLOYMENT:-production}:task-latest
+    <<: *secure
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.task.env
+
+  # Utils
+  backup:
+    image: registry.example.com/cloud/backup/backup:latest
+    <<: *common
+    env_file:
+      - ${ENV_DIR:-/home/ubuntu/platform/envs/}.backup.env
+    volumes:
+      - backup_data:/var/backup
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/postgres
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/redis/master
+  mongo_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/mongo
+  backup_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/backup
+  traefik_certs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/traefik
+  skm_uploads:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_PATH:-/data}/skm/uploads
+  nginx_config: {}
+  nginx_js: {}
+  nginx_tmp: {}
+  nginx_glob_tmp: {}
+
+networks:
+  platform:
+    external: true

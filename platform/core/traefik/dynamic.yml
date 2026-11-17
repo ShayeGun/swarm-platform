@@ -1,0 +1,43 @@
+http:
+  middlewares:
+    redirect-to-https:
+      redirectScheme:
+        scheme: https
+    rate-limiter:
+      rateLimit:
+        average: 20
+        period: 1s
+        burst: 40
+
+  routers:
+    http-redirect-to-https:
+      entryPoints:
+        - web
+      rule: 'Host(`kc.{{env "DOMAIN"}}`) || Host(`mirror.{{env "DOMAIN"}}`) || Host(`docker-mirror.{{env "DOMAIN"}}`) || Host(`minio.{{env "DOMAIN"}}`) || Host(`jira.{{env "DOMAIN"}}`) || Host(`mm.{{env "DOMAIN"}}`) || Host(`grafana.{{env "DOMAIN"}}`) || Host(`git.{{env "DOMAIN"}}`)'
+      service: noop@internal
+      middlewares:
+        - redirect-to-https
+
+tls:
+  certificates:
+    - certFile: /letsencrypt/certificate.pem
+      keyFile: /letsencrypt/key.pem
+
+  options:
+    default:
+      minVersion: VersionTLS12
+      cipherSuites:
+        - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
+        - TLS_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_RSA_WITH_AES_256_CBC_SHA
+
+      curvePreferences:
+        - secp521r1
+        - secp384r1
+        - x25519
+        - secp256r1
+      sniStrict: true

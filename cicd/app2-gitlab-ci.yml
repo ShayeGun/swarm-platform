@@ -1,0 +1,114 @@
+stages:
+  - build
+  - deploy
+
+build:
+  stage: build
+  image: docker:latest
+  rules:
+    # Always build merge requests
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # Don't run branch pipeline if there's an open MR
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "production"
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+  before_script:
+    - docker info
+    - export DOCKER_BUILDKIT=1
+    - cp $ALPINE_PUB $(dirname ${ALPINE_REGISTRY})/${ALPINE_PUB_HASH}
+    - export VERSION=$(echo ${CI_COMMIT_SHA} | cut -c1-7)
+    - REF_NAME="${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-$CI_COMMIT_BRANCH}"
+    - export JIRA_TASK=$(echo "${REF_NAME}" | tr '[:upper:]' '[:lower:]' | grep -oE 'nes-[0-9]{2,}' || echo "unknown")
+    - |
+      if [ "$CI_COMMIT_REF_NAME" == "production" ]; then
+        export DEPLOYMENT="production"
+      elif [ "$CI_COMMIT_REF_NAME" == "master" ]; then
+        export DEPLOYMENT="stage"
+      elif [ "$CI_COMMIT_REF_NAME" == "develop" ]; then
+        export DEPLOYMENT="develop"
+      else
+        export DEPLOYMENT="local"
+      fi
+    - export IMAGE_NAME="${CI_REGISTRY}/cloud/server/skm-${DEPLOYMENT}"
+    - export TAGS="web-latest web-$JIRA_TASK web-$VERSION task-latest task-$JIRA_TASK task-$VERSION"
+    - echo "image => $IMAGE_NAME"
+    - echo "tags => $TAGS"
+  after_script:
+    - |
+      case "$CI_JOB_STATUS" in
+        success)
+          echo "✅ Docker images pushed successfully."
+          ;;
+        failed)
+          echo "❌ Building failed!"
+          ;;
+        *)
+          echo "⚠️ Building ended with status: $CI_JOB_STATUS"
+          ;;
+      esac
+  script:
+    - set -e
+    - echo $CI_REGISTRY_PASSWORD | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+    - docker build --build-context temp=$(dirname ${DEBIAN_REGISTRY}) --build-arg NPM_TOKEN=${NPM_TOKEN} --build-arg NPM_REGISTRY=${NPM_REGISTRY} --build-arg DEBIAN_REGISTRY=$(basename ${DEBIAN_REGISTRY}) --build-arg ALPINE_REGISTRY=$(basename ${ALPINE_REGISTRY}) --build-arg ALPINE_PUB=${ALPINE_PUB_HASH} -f Dockerfile.web -t $IMAGE_NAME:web-latest -t $IMAGE_NAME:web-$JIRA_TASK -t $IMAGE_NAME:web-$VERSION .
+    - docker build --build-context temp=$(dirname ${DEBIAN_REGISTRY}) --build-arg NPM_TOKEN=${NPM_TOKEN} --build-arg NPM_REGISTRY=${NPM_REGISTRY} --build-arg DEBIAN_REGISTRY=$(basename ${DEBIAN_REGISTRY}) --build-arg ALPINE_REGISTRY=$(basename ${ALPINE_REGISTRY}) --build-arg ALPINE_PUB=${ALPINE_PUB_HASH} -f Dockerfile.task -t $IMAGE_NAME:task-latest -t $IMAGE_NAME:task-$JIRA_TASK -t $IMAGE_NAME:task-$VERSION .
+    - |
+      for tag in $TAGS; do
+        docker push $IMAGE_NAME:$tag
+      done
+    - echo "Docker images pushed successfully."
+
+deploy:
+  stage: deploy
+  image: docker:latest
+  needs: ['build']
+  rules:
+    - if: $CI_COMMIT_BRANCH == "production" || $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "develop"
+      when: on_success
+  before_script:
+    - docker info
+    - |
+      if [ "$CI_COMMIT_REF_NAME" == "production" ]; then
+        export DEPLOYMENT="production"
+        export DEPLOY_SERVER=$CI_SERVER_USER@$CI_PROD_SERVER_IP
+      elif [ "$CI_COMMIT_REF_NAME" == "master" ]; then
+        export DEPLOYMENT="stage"
+        export DEPLOY_SERVER=$CI_SERVER_USER@$CI_STG_SERVER_IP
+      elif [ "$CI_COMMIT_REF_NAME" == "develop" ]; then
+        export DEPLOYMENT="develop"
+        export DEPLOY_SERVER=$CI_SERVER_USER@$CI_DEV_SERVER_IP
+      else
+        echo "No deployment trigger for this branch."
+        exit 0
+      fi
+    - chmod 400 $CI_ID_RSA
+    - export IMAGE_NAME="${CI_REGISTRY}/cloud/server/skm-${DEPLOYMENT}"
+  after_script:
+    - |
+      case "$CI_JOB_STATUS" in
+        success)
+          echo "✅ Deployment completed successfully. 🚀"
+          ;;
+        failed)
+          echo "❌ Deployment failed!"
+          ;;
+        *)
+          echo "⚠️ Deployment ended with status: $CI_JOB_STATUS"
+          ;;
+      esac
+  script:
+    - set -e
+    - ssh -i $CI_ID_RSA -o StrictHostKeyChecking=no $DEPLOY_SERVER "echo $CI_REGISTRY_PASSWORD | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin"
+    - ssh -i $CI_ID_RSA -o StrictHostKeyChecking=no $DEPLOY_SERVER "docker pull $IMAGE_NAME:web-latest"
+    - ssh -i $CI_ID_RSA -o StrictHostKeyChecking=no $DEPLOY_SERVER "docker pull $IMAGE_NAME:task-latest"
+    - |
+      ssh -i $CI_ID_RSA -o StrictHostKeyChecking=no $DEPLOY_SERVER "
+      set -a
+      . $CI_HOST_ENV_FILE
+      set +a
+      docker service rm $CI_SERVICE_NAME
+      docker stack deploy --resolve-image never -c $CI_COMPOSE_FILE $CI_STACK_NAME
+      "
+    - ssh -i $CI_ID_RSA -o StrictHostKeyChecking=no $DEPLOY_SERVER "docker
+      logout $CI_REGISTRY"
